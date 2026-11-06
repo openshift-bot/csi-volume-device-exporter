@@ -3,10 +3,14 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // setupTestSysfs creates /sys/dev/block/{major}:{minor} -> target symlink
@@ -272,26 +276,13 @@ func TestKubeletDiscoverer_BlockVolume_SkipsWhenStatFails(t *testing.T) {
 	pvName := "pvc-block-001"
 	podUID := "pod-uid-block-001"
 
-	// Create the volumeDevices directory structure without a device file.
-	// stat() on the missing file should cause the block volume to be skipped.
-	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi", pvName)
+	// Create a dangling device symlink. stat() should cause the block volume
+	// to be skipped.
+	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi")
 	if err := os.MkdirAll(blockDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-
-	// Create vol_data.json at the plugin staging path
-	volDataDir := filepath.Join(kubeletRoot, "plugins", "kubernetes.io~csi", "volumeDevices", pvName, "data")
-	if err := os.MkdirAll(volDataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	vd := volData{
-		VolumeHandle:        "block-vol-handle-001",
-		DriverName:          "csi-powerstore.dellemc.com",
-		SpecVolID:           pvName,
-		VolumeLifecycleMode: "Persistent",
-	}
-	data, _ := json.Marshal(vd)
-	if err := os.WriteFile(filepath.Join(volDataDir, "vol_data.json"), data, 0o644); err != nil {
+	if err := os.Symlink("/missing-device", filepath.Join(blockDir, pvName)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,7 +294,64 @@ func TestKubeletDiscoverer_BlockVolume_SkipsWhenStatFails(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(results) != 0 {
-		t.Errorf("expected 0 results when device file is missing, got %d", len(results))
+		t.Errorf("expected 0 results when device symlink is dangling, got %d", len(results))
+	}
+}
+
+func TestKubeletDiscoverer_BlockVolumeSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	kubeletRoot := filepath.Join(tmpDir, "kubelet")
+	sysDir := filepath.Join(tmpDir, "sys")
+	pvName := "pvc-block-symlink"
+	podUID := "pod-uid-block-symlink"
+
+	// Kubelet publishes raw-block volumes as a symlink to the device, rather
+	// than as a directory containing a device file.
+	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi")
+	if err := os.MkdirAll(blockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(blockDir, pvName)); err != nil {
+		t.Fatal(err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Stat("/dev/null", &st); err != nil {
+		t.Fatal(err)
+	}
+	setupTestSysfs(t, sysDir, fmt.Sprintf("%d:%d", unix.Major(st.Rdev), unix.Minor(st.Rdev)), "../../devices/virtual/block/sda", "")
+
+	// Unlike pod volume paths, raw-block metadata is stored under
+	// plugins/kubernetes.io/csi.
+	volDataDir := filepath.Join(kubeletRoot, "plugins", "kubernetes.io", "csi", "volumeDevices", pvName, "data")
+	if err := os.MkdirAll(volDataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(volData{
+		VolumeHandle:        "block-vol-handle-symlink",
+		DriverName:          "csi.example.com",
+		SpecVolID:           pvName,
+		VolumeLifecycleMode: "Persistent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volDataDir, "vol_data.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewKubeletDiscoverer(kubeletRoot, sysDir, "worker-1", slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	results, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := results, []VolumeDevice{{
+		VolumeHandle: "block-vol-handle-symlink",
+		Driver:       "csi.example.com",
+		Device:       "sda",
+		Node:         "worker-1",
+	}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("unexpected discovery result: got %+v, want %+v", got, want)
 	}
 }
 
@@ -315,29 +363,13 @@ func TestKubeletDiscoverer_BlockVolume_SkipsRegularFile(t *testing.T) {
 	pvName := "pvc-block-002"
 	podUID := "pod-uid-block-002"
 
-	// Create the volumeDevices directory structure with a regular file
-	// (st_rdev will be 0 for regular files).
-	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi", pvName)
+	// Create a regular file at the device entry location. st_rdev is zero for
+	// regular files.
+	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi")
 	if err := os.MkdirAll(blockDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(blockDir, pvName), []byte("fake"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create vol_data.json at the plugin staging path
-	volDataDir := filepath.Join(kubeletRoot, "plugins", "kubernetes.io~csi", "volumeDevices", pvName, "data")
-	if err := os.MkdirAll(volDataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	vd := volData{
-		VolumeHandle:        "block-vol-handle-002",
-		DriverName:          "csi-powerstore.dellemc.com",
-		SpecVolID:           pvName,
-		VolumeLifecycleMode: "Persistent",
-	}
-	data, _ := json.Marshal(vd)
-	if err := os.WriteFile(filepath.Join(volDataDir, "vol_data.json"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -362,13 +394,12 @@ func TestKubeletDiscoverer_BlockVolume_SkipsMissingVolData(t *testing.T) {
 	pvName := "pvc-block-003"
 	podUID := "pod-uid-block-003"
 
-	// Create the volumeDevices directory structure with a regular file
-	// but NO vol_data.json at the staging path.
-	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi", pvName)
+	// Create a valid device symlink but no vol_data.json at the staging path.
+	blockDir := filepath.Join(kubeletRoot, "pods", podUID, "volumeDevices", "kubernetes.io~csi")
 	if err := os.MkdirAll(blockDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(blockDir, pvName), []byte("fake"), 0o644); err != nil {
+	if err := os.Symlink("/dev/null", filepath.Join(blockDir, pvName)); err != nil {
 		t.Fatal(err)
 	}
 

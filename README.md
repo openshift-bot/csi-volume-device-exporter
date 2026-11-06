@@ -23,7 +23,7 @@ csiaddons_volume_node_device_info{node="worker-1", volume_handle="csi-vol-id", d
 ### Discovery Strategy
 
 - **Filesystem volumes:** Walks kubelet pod directories (`pods/*/volumes/kubernetes.io~csi/*/`), reads `vol_data.json`, and uses `stat()` on the `mount/` subdirectory to resolve the block device via sysfs. A mount-propagation sanity check prevents false positives if `HostToContainer` propagation fails. Requires `mountPropagation: HostToContainer` on the kubelet volume mount.
-- **Block volumes:** Walks `pods/*/volumeDevices/kubernetes.io~csi/*/`, `stat()`s the device file for `st_rdev`, and reads `vol_data.json` from the plugin staging path (`plugins/kubernetes.io~csi/volumeDevices/<specName>/data/`). Same sysfs resolution as filesystem volumes.
+- **Block volumes:** Walks device symlinks at `pods/*/volumeDevices/kubernetes.io~csi/<specName>`, `stat()`s their targets for `st_rdev`, and reads `vol_data.json` from the plugin staging path (`plugins/kubernetes.io/csi/volumeDevices/<specName>/data/`). Same sysfs resolution as filesystem volumes.
 
 ### Supported Drivers
 
@@ -119,6 +119,7 @@ The exporter runs as root (UID 0) with:
 - `capabilities.drop: [ALL]`
 - `readOnlyRootFilesystem: true`
 - `seccompProfile: RuntimeDefault`
+- `seLinuxOptions.type: spc_t`
 - `seLinuxOptions.level: "s0"`
 - No Kubernetes API server access (`automountServiceAccountToken: false`)
 - All hostPath mounts are read-only
@@ -129,6 +130,13 @@ The exporter runs as root (UID 0) with:
 - Static binary (`CGO_ENABLED=0`)
 
 Root is required because kubelet writes `vol_data.json` with `0600` permissions.
+
+On SELinux-enabled nodes, this deployment uses `spc_t:s0` to read host metadata
+such as kubelet's `vol_data.json`. Setting only `level: "s0"` leaves the default
+`container_t` type, which does not permit these file reads under the standard
+container SELinux policy. `spc_t` grants broad SELinux access; the other container
+security restrictions above still apply. The OpenShift SCC uses `RunAsAny` to
+permit this explicit context, but does not assign it automatically.
 
 ## Development
 
